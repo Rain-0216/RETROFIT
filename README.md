@@ -14,7 +14,7 @@ Our [models](..) will be available on the HF Hub soon.
 You need to first refer to the [BinT5](https://github.com/AISE-TUDelft/Capybara-BinT5/tree/main) setup, download and properly configure the official CodeT5 code and the [Capybara dataset](https://huggingface.co/datasets/AISE-TUDelft/Capybara) .
 
 ### Train
-Our method starts from the fully fine-tuned CodeT5-C model. To launch training with our LoRI Adapter, simply replace the official CodeT5 models.py and run_gen.py with our supplied models_lori.py and run_gen_lori.py, then run the standard CodeT5 training script. We follow the base configuration of the BinT5 project and set the learning rate to 1e-4.
+Our method starts from the fully fine-tuned CodeT5-C model. To launch training with our LoRI Adapter, simply replace the official CodeT5 models.py and run_gen.py with our supplied models_low_rank.py and run_gen_low_rank.py, then run the standard CodeT5 training script. We follow the base configuration of the BinT5 project and set the learning rate to 1e-4.
 ```bash
 bash CodeT5_train.sh
 ```
