@@ -204,12 +204,12 @@ def apply_mask_to_lora_B_(peft_model: PeftModel, mask: Dict[str, torch.Tensor], 
 
 
 # =========================
-# Localizer (full weights) kept; added LocalizerB (LoRA-B)
+# Retrofit (full weights) kept; added RetrofitB (LoRA-B)
 # =========================
-class Localizer:
+class Retrofit:
     """
     Common logic: train gate S optimization/diagnostic/quick-eval interface.
-    LocalizerB overrides reset/apply/quick_eval to work on LoRA-B.
+    RetrofitB overrides reset/apply/quick_eval to work on LoRA-B.
     """
 
     def __init__(
@@ -291,9 +291,9 @@ class Localizer:
                 m0 = (self._sigmoid(p) >= 0.5).float()
                 ones += int(torch.count_nonzero(m0))
                 total += m0.numel()
-            logger.info(f"[Localize] init sparsity ≈ {ones / total:.6f} ({ones}/{total})")
+            logger.info(f"[retrofit] init sparsity ≈ {ones / total:.6f} ({ones}/{total})")
 
-    # these will be overridden in LocalizerB
+    # these will be overridden in RetrofitB
     @torch.no_grad()
     def _reset_to_pretrained(self):
         ...
@@ -312,7 +312,7 @@ class Localizer:
     def _report_sparsity(self, gamma: Dict[str, torch.Tensor], tag="final"):
         total = sum(int(v.numel()) for v in gamma.values())
         ones = sum(int(torch.count_nonzero(v)) for v in gamma.values())
-        logger.info(f"[Localize] {tag} sparsity = {ones / total:.6f} ({ones}/{total})")
+        logger.info(f"[retrofit] {tag} sparsity = {ones / total:.6f} ({ones}/{total})")
 
     def _clean_ids_for_decode(self, ids, tok):
         ids = ids.detach().cpu().tolist()
@@ -382,7 +382,7 @@ class Localizer:
 
         # training epochs
         for ep in range(self.epochs):
-            logger.info(f"[Localize] {log_prefix} epoch={ep + 1}/{self.epochs}")
+            logger.info(f"[retrofit] {log_prefix} epoch={ep + 1}/{self.epochs}")
 
             self._reset_to_pretrained()
             self._apply_soft_merge_inplace()
@@ -449,7 +449,8 @@ class Localizer:
                 epoch_none += kg_out.get("num_none", 0)
 
                 kg_loss = kg_out["L_kg"]
-
+                
+                total_elem = sum(p.numel() for p in self.mask_params.values())
                 l1_reg = sum(p.abs().sum() for p in self.mask_params.values())
                 l2_reg = sum((p ** 2).sum() for p in self.mask_params.values())
 
@@ -481,8 +482,7 @@ class Localizer:
                         mean_conf = torch.tensor(0.0, device=ce_loss.device)
                     logger.info(
                         f"[Step {step}] CE={ce_loss.item():.4f} | KG={kg_loss.item():.6f} | "
-                        f"L1={l1_reg.item():.6f} | L2={l2_reg.item():.6f} | "
-                        f"Total={total_loss.item():.6f} | mean_conf_old={mean_conf:.3f}"
+                        f"L1={self.l1*l1_reg.item()/total_elem:.6f} | L2={self.l2*l2_reg.item()/total_elem:.6f} | "
                     )
 
             # epoch summary
@@ -512,8 +512,8 @@ class Localizer:
             logger.info(
                 f"[Epoch {ep + 1:02d}] CE={sum(ce_losses) / len(ce_losses):.4f} | "
                 f"KG={sum(kg_losses) / len(kg_losses):.6f} | "
-                f"L1={sum(l1_losses) / len(l1_losses):.6f} | "
-                f"L2={sum(l2_losses) / len(l2_losses):.6f} | "
+                f"L1={self.l1 * sum(l1_losses) / len(l1_losses) / total_elem:.6f} | "
+                f"L2={self.l2 * sum(l2_losses) / len(l2_losses) / total_elem:.6f} | "
                 f"Total={sum(total_losses) / len(total_losses):.6f}"
             )
 
@@ -522,9 +522,9 @@ class Localizer:
                 gamma_tmp = self._get_soft_mask()
                 try:
                     eval_loss = self._quick_eval_with_mask(gamma_tmp, dataloader, max_batches=2)
-                    logger.info(f"[Localize] {log_prefix} epoch={ep + 1} quick_eval_loss≈{eval_loss:.4f}")
+                    logger.info(f"[retrofit] {log_prefix} epoch={ep + 1} quick_eval_loss≈{eval_loss:.4f}")
                 except Exception as e:
-                    logger.warning(f"[Localize] quick eval skipped: {e}")
+                    logger.warning(f"[retrofit] quick eval skipped: {e}")
 
         gamma = self._get_soft_mask()
         self._report_sparsity(gamma, tag="final")
@@ -532,11 +532,11 @@ class Localizer:
 
     @torch.no_grad()
     def _quick_eval_with_mask(self, gamma: Dict[str, torch.Tensor], dataloader: DataLoader, max_batches=2) -> float:
-        # placeholder: implemented in LocalizerB
+        # placeholder: implemented in RetrofitB
         raise NotImplementedError
 
 
-class LocalizerB(Localizer):
+class RetrofitB(Retrofit):
     """
     Work on LoRA-B:
       - τ := B_ft (B_pre≈0)
@@ -591,7 +591,7 @@ class LocalizerB(Localizer):
 
 
 # =========================
-# Stitch (for B)
+# Merge (for B)
 # =========================
 def average_overlap_masks(masks_list: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
     sum_masks: Dict[str, torch.Tensor] = {}
@@ -608,7 +608,7 @@ def average_overlap_masks(masks_list: List[Dict[str, torch.Tensor]]) -> List[Dic
     return processed
 
 
-def stitch_lora_B(tauB_list: List[Dict[str, torch.Tensor]],
+def merge_lora_B(tauB_list: List[Dict[str, torch.Tensor]],
                   processed_masks: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """
     B merge: B_merged[n] = Σ_i ( processed_masks[i][n] ⊙ tauB_list[i][n] )
@@ -867,16 +867,16 @@ def save_merged_full_state_dict_from_loraB(
 
 
 # =========================
-# End2End（LoRA-B：Localization & Stitch & Export）
+# End2End（LoRA-B：Retrofit & Merge & Export）
 # =========================
-def localize_and_stitch_loraB_and_export_full(
+def retrofit_and_merge_loraB_and_export_full(
         base_model_path: str,
         adapter_paths: List[str],
         val_files: List[str],
         out_adapter_dir: str,
         out_full_pt_path: str,  # .pt path for soft-gate merged full weights
         *,
-        # Localizer hyperparams
+        # Retrofit hyperparams
         loc_epochs: int = 10,
         loc_lr: float = 5e6,
         loc_l1: float = 10.0,
@@ -911,7 +911,7 @@ def localize_and_stitch_loraB_and_export_full(
         dls_loc.append(DataLoader(data_loc, sampler=SequentialSampler(data_loc),
                                   batch_size=batch_size, num_workers=2, pin_memory=True))
 
-    # 2) per adapter: build peft_model (not merged), collect τ_B, and localize (get soft gate)
+    # 2) per adapter: build peft_model (not merged), collect τ_B, and retrofit (get soft gate)
     tauB_list: List[Dict[str, torch.Tensor]] = []
     masks_soft: List[Dict[str, torch.Tensor]] = []
 
@@ -935,9 +935,9 @@ def localize_and_stitch_loraB_and_export_full(
                 p.requires_grad_(False)
 
         tau_B = collect_lora_B_tensors(peft, device)  # on device (for training & quick_eval)
-        tauB_list.append({k: v.detach().cpu() for k, v in tau_B.items()})   # CPU version (for stitch)
+        tauB_list.append({k: v.detach().cpu() for k, v in tau_B.items()})   # CPU version (for merge)
 
-        localizer = LocalizerB(
+        retrofit = RetrofitB(
             peft_model=peft,
             tokenizer=tokenizer,
             tau_B=tau_B,
@@ -951,10 +951,10 @@ def localize_and_stitch_loraB_and_export_full(
             sparsity=loc_sparsity,
             use_kg_loss=use_kg_loss,
         )
-        _ = localizer.train_graft(dls_loc[i], log_prefix=f"task#{i + 1}")
+        _ = retrofit.train_graft(dls_loc[i], log_prefix=f"task#{i + 1}")
 
         # get soft gate (σ(S)), move to CPU
-        gate_soft_i = {k: torch.sigmoid(p).detach().cpu() for k, p in localizer.mask_params.items()}
+        gate_soft_i = {k: torch.sigmoid(p).detach().cpu() for k, p in retrofit.mask_params.items()}
         masks_soft.append(gate_soft_i)
 
         # backup per-task soft gate
@@ -962,10 +962,10 @@ def localize_and_stitch_loraB_and_export_full(
 
         # optional quick sanity: soft / full-τ / all-one
         try:
-            localizer._reset_to_pretrained()
-            loss_soft = localizer._quick_eval_with_mask(gate_soft_i, dls_loc[i], max_batches=16)
+            retrofit._reset_to_pretrained()
+            loss_soft = retrofit._quick_eval_with_mask(gate_soft_i, dls_loc[i], max_batches=16)
             gate_one = {k: torch.ones_like(v) for k, v in gate_soft_i.items()}
-            loss_full = localizer._quick_eval_with_mask(gate_one, dls_loc[i], max_batches=16)
+            loss_full = retrofit._quick_eval_with_mask(gate_one, dls_loc[i], max_batches=16)
             logger.info(f"[Sanity(B)] task#{i + 1}: loss_soft={loss_soft:.4f} | loss_fullτ={loss_full:.4f}")
         except Exception as e:
             logger.warning(f"[Sanity(B)] task#{i + 1} skipped: {e}")
@@ -973,11 +973,11 @@ def localize_and_stitch_loraB_and_export_full(
         del peft, base
         torch.cuda.empty_cache()
 
-    # 3) Stitching (soft): overlap normalization → weighted sum on B
-    logger.info("[Stitching/Soft] average-on-overlaps & accumulate B ...")
+    # 3) Merging (soft): overlap normalization → weighted sum on B
+    logger.info("[Merging/Soft] average-on-overlaps & accumulate B ...")
     processed_soft = average_overlap_masks(masks_soft)  # normalized per-task soft gates
     # merged_B_soft[n] = Σ_i processed_soft[i][n] ⊙ tauB_list[i][n]
-    merged_B_soft = stitch_lora_B(
+    merged_B_soft = merge_lora_B(
         [{k: v.cpu() for k, v in tauB.items()} for tauB in tauB_list],
         [{k: v.cpu() for k, v in g.items()} for g in processed_soft]
     )
@@ -1119,7 +1119,7 @@ if __name__ == "__main__":
     os.makedirs(args.out_adapter_dir, exist_ok=True)
     os.makedirs(os.path.dirname(args.out_full_pt_path), exist_ok=True)
 
-    localize_and_stitch_loraB_and_export_full(
+    retrofit_and_merge_loraB_and_export_full(
         base_model_path=args.base_model_path,
         adapter_paths=args.adapter_paths,
         val_files=args.val_files,
