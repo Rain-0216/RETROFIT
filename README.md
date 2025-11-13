@@ -21,7 +21,7 @@ We adopt a multilayer perceptron (MLP) classifier as the backbone model. First, 
 
 The following commands are required to execute training and merging:
 
-```
+```bash
 python Malware_Detection/train_ours.py
 ```
 
