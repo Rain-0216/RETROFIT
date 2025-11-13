@@ -4,6 +4,31 @@ This repository contains the official implementation of our paper on achieving B
 
 ## MALWARE DETECTION
 
+### Model
+
+Our model is defined in **Malware_Detection/model.py**.
+
+### Data
+
+We adopt the dataset from [Transcendent](https://ieeexplore.ieee.org/abstract/document/9833659)
+, which spans five years (from 2014 to 2018). It contains 232,848 benign and 26,387 malicious Android applications collected from [AndroZoo](https://androzoo.uni.lu/). 
+
+Following prior work, we extract the widely used [Drebin](https://media.telefonicatech.com/telefonicatech/uploads/2021/1/4915_2014-ndss.pdf) features.
+
+### Train & Merge
+
+We adopt a multilayer perceptron (MLP) classifier as the backbone model. First, a base model is trained on 2014 data using a cold-start strategy; then, a low-rank update is performed on the new task dataset using a warm-start strategy, followed by a merging operation, ultimately obtaining a target model adapted to the new task.
+
+The following commands are required to execute training and merging:
+
+```
+python Malware_Detection/train_ours.py
+```
+
+### Eval
+
+First, we use the built-in f1_score function imported from sklearn.metrics to sequentially evaluate the F1 score of each task's model on the task itself, as well as the F1 scores across all previous tasks, and then calculate the AUT and PTR values.
+
 
 ## BINARY ANALYSIS
 
