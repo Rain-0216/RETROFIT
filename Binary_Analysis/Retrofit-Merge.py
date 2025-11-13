@@ -10,6 +10,7 @@ from tqdm import tqdm
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Literal, Mapping, Union
 from torch.utils.data import DataLoader, SequentialSampler, TensorDataset
+import torch.nn.functional as F
 
 from transformers import T5ForConditionalGeneration, RobertaTokenizer
 from peft import PeftModel
@@ -17,8 +18,7 @@ from safetensors.torch import load_file as safetensors_load, save_file as safete
 from copy import deepcopy
 import safetensors.torch as st
 from safetensors.torch import load_file
-
-import torch.nn.functional as F
+from util.retrofit_config import parse_args
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -226,6 +226,7 @@ class Localizer:
             sigmoid_bias: float = 5.0,
             sparsity: Optional[float] = 1e-5,
             restrict_to_linear: bool = True,  # kept for compatibility
+            use_kg_loss: bool = False,
     ):
         self.model = base_model
         self.tok = tokenizer
@@ -238,6 +239,7 @@ class Localizer:
         self.sigmoid_bias = sigmoid_bias
         self.sparsity = sparsity
         self.restrict_to_linear = restrict_to_linear
+        self.use_kg_loss = use_kg_loss
 
         # τ to device
         self.tau: Dict[str, torch.Tensor] = {k: v.to(device) for k, v in tau.items()}
@@ -447,12 +449,11 @@ class Localizer:
                 epoch_none += kg_out.get("num_none", 0)
 
                 kg_loss = kg_out["L_kg"]
-                L_keep = kg_out.get("L_keep", None)
-                L_gain = kg_out.get("L_gain", None)
 
                 l1_reg = sum(p.abs().sum() for p in self.mask_params.values())
                 l2_reg = sum((p ** 2).sum() for p in self.mask_params.values())
 
+                kg_loss = kg_out["L_kg"] if self.use_kg_loss else torch.tensor(0.0, device=ce_loss.device)
                 total_loss = ce_loss + kg_loss + self.l1 * l1_reg + self.l2 * l2_reg
                 total_loss.backward()
 
@@ -463,19 +464,23 @@ class Localizer:
 
                 # record losses
                 ce_losses.append(ce_loss.item())
-                kg_losses.append(kg_loss.item() if isinstance(kg_loss, torch.Tensor) else float(kg_loss))
                 total_losses.append(total_loss.item())
-                keep_losses.append(L_keep.item() if isinstance(L_keep, torch.Tensor) else 0.0)
-                gain_losses.append(L_gain.item() if isinstance(L_gain, torch.Tensor) else 0.0)
                 l1_losses.append(l1_reg.item())
                 l2_losses.append(l2_reg.item())
 
+                if self.use_kg_loss:
+                    kg_losses.append(kg_loss.item() if isinstance(kg_loss, torch.Tensor) else float(kg_loss))
+                else:
+                    kg_losses.append(0.0)
+
                 # per-step summary (every 50 steps)
                 if (step % 50) == 0:
-                    mean_conf = float(kg_out["mean_conf_old"].mean().item())
+                    if self.use_kg_loss:
+                        mean_conf = float(kg_out["mean_conf_old"].mean().item())
+                    else:
+                        mean_conf = torch.tensor(0.0, device=ce_loss.device)
                     logger.info(
                         f"[Step {step}] CE={ce_loss.item():.4f} | KG={kg_loss.item():.6f} | "
-                        f"L_keep={keep_losses[-1]:.6f} | L_gain={gain_losses[-1]:.6f} | "
                         f"L1={l1_reg.item():.6f} | L2={l2_reg.item():.6f} | "
                         f"Total={total_loss.item():.6f} | mean_conf_old={mean_conf:.3f}"
                     )
@@ -507,8 +512,6 @@ class Localizer:
             logger.info(
                 f"[Epoch {ep + 1:02d}] CE={sum(ce_losses) / len(ce_losses):.4f} | "
                 f"KG={sum(kg_losses) / len(kg_losses):.6f} | "
-                f"L_keep={sum(keep_losses) / len(keep_losses):.6f} | "
-                f"L_gain={sum(gain_losses) / len(gain_losses):.6f} | "
                 f"L1={sum(l1_losses) / len(l1_losses):.6f} | "
                 f"L2={sum(l2_losses) / len(l2_losses):.6f} | "
                 f"Total={sum(total_losses) / len(total_losses):.6f}"
@@ -545,11 +548,11 @@ class LocalizerB(Localizer):
     def __init__(self, peft_model: PeftModel, tokenizer: RobertaTokenizer,
                  tau_B: Dict[str, torch.Tensor], device: torch.device,
                  lr=1e7, l1_strength=10.0, l2_strength=10.0, num_epochs=10, max_batches=8,
-                 sigmoid_bias=5.0, sparsity: Optional[float] = 1e-5):
+                 sigmoid_bias=5.0, sparsity: Optional[float] = 1e-5, use_kg_loss=False):
         super().__init__(
             base_model=peft_model, tokenizer=tokenizer, tau=tau_B, device=device,
             lr=lr, l1_strength=l1_strength, l2_strength=l2_strength, num_epochs=num_epochs, max_batches=max_batches,
-            sigmoid_bias=sigmoid_bias, sparsity=sparsity, restrict_to_linear=True
+            sigmoid_bias=sigmoid_bias, sparsity=sparsity, restrict_to_linear=True, use_kg_loss=use_kg_loss
         )
         # === ensure B requires grad; freeze A and all non-B params ===
         for n, p in self.model.named_parameters():
@@ -585,45 +588,6 @@ class LocalizerB(Localizer):
             tot += out.loss.item();
             cnt += 1
         return tot / max(1, cnt)
-
-
-# ===== Sanity helpers: single-task graft eval (kept for full-path or self-eval on B-path) =====
-@torch.no_grad()
-def eval_graft(base_model, tau_i, gate_i, dataloader, device):
-    """
-    Original full-weight eval function, kept for comparison.
-    """
-    import copy
-    m = copy.deepcopy(base_model).to(device).eval()
-    sd = m.state_dict()
-    for k, g in gate_i.items():
-        if (k in sd) and sd[k].dtype.is_floating_point and (k in tau_i) and (g.shape == sd[k].shape):
-            sd[k] = (sd[k] + g.to(sd[k].device) * tau_i[k].to(sd[k].device)).detach()
-    m.load_state_dict(sd, strict=False)
-    if hasattr(m, "tie_weights"):
-        m.tie_weights()
-    m.eval()
-
-    tot, cnt = 0.0, 0
-    for batch in dataloader:
-        input_ids = batch[0].to(device)
-        labels = batch[1].to(device)
-        out = m(input_ids=input_ids, labels=labels)
-        tot += out.loss.item()
-        cnt += 1
-    del m
-    torch.cuda.empty_cache()
-    return tot / max(1, cnt)
-
-
-def make_gate_from_maskparams(mask_params: Dict[str, torch.nn.Parameter],
-                              hard_threshold: float = 0.5):
-    gate_soft, gate_bin = {}, {}
-    for k, p in mask_params.items():
-        s = torch.sigmoid(p.detach().cpu())
-        gate_soft[k] = s
-        gate_bin[k] = (s >= hard_threshold).float()
-    return gate_soft, gate_bin
 
 
 # =========================
@@ -703,6 +667,7 @@ def load_adapter_sd(adapter_path: str) -> Tuple[dict, dict]:
     else:
         raise FileNotFoundError("adapter model not found in safetensors or bin at " + adapter_path)
     return cfg, sd
+
 
 def strip_known_prefixes(path: str) -> str:
     """
@@ -919,6 +884,7 @@ def localize_and_stitch_loraB_and_export_full(
         loc_sigmoid_bias: float = 5.0,
         loc_sparsity: float = 0.01,
         loc_max_batches: int = 512,
+        use_kg_loss: bool = False,
         # data
         loc_sample_cap: int = 512,
         batch_size: int = 4,
@@ -982,7 +948,8 @@ def localize_and_stitch_loraB_and_export_full(
             num_epochs=loc_epochs,
             max_batches=loc_max_batches,
             sigmoid_bias=loc_sigmoid_bias,
-            sparsity=loc_sparsity
+            sparsity=loc_sparsity,
+            use_kg_loss=use_kg_loss,
         )
         _ = localizer.train_graft(dls_loc[i], log_prefix=f"task#{i + 1}")
 
@@ -1032,224 +999,6 @@ def localize_and_stitch_loraB_and_export_full(
     )
     logger.info(f"[Export] soft-merged full state_dict saved to: {out_full_pt_path}")
     logger.info("Done.")
-
-# ---------- helper functions ----------
-def _gate(x: torch.Tensor, mode: str) -> torch.Tensor:
-    if mode == "sigmoid":
-        return torch.sigmoid(x)
-    elif mode == "softplus":
-        return F.softplus(x)
-    elif mode == "none":
-        return x
-    else:
-        raise ValueError(f"Unknown gate mode {mode}")
-
-
-def _kl_vec(student_logits: torch.Tensor, teacher_logits: torch.Tensor, T: float = 1.0) -> torch.Tensor:
-    """
-    Compute per-token KL divergence. Returns [B, T]
-    """
-    log_pS = F.log_softmax(student_logits / T, dim=-1)
-    pT = F.softmax(teacher_logits / T, dim=-1)
-    return F.kl_div(log_pS, pT, reduction="none").sum(dim=-1) * (T * T)
-
-
-def _lookup_per_class(y: torch.Tensor, mapping: Optional[Mapping[int, float]], default: float) -> torch.Tensor:
-    if mapping is None:
-        return torch.full_like(y, float(default), dtype=torch.float)
-    else:
-        out = torch.full_like(y, float(default), dtype=torch.float)
-        for k, v in mapping.items():
-            out[y == k] = float(v)
-        return out
-
-
-# Placeholder for trueclass_prob or percentile rank
-def _trueclass_prob(logits, y, T=1.0, agg="prefix_geom", seq_conf_t=10, platt_params=None):
-    p = F.softmax(logits, dim=-1).gather(-1, y.unsqueeze(-1)).squeeze(-1)
-    return p  # simple version, can replace with real sequence-aware logic
-
-
-def _percentile_rank_trueprob(logits, y, rank_calib, T=1.0):
-    p = F.softmax(logits, dim=-1).gather(-1, y.unsqueeze(-1)).squeeze(-1)
-    return p
-
-
-def merge_teacher_loss_v2(
-        y: torch.Tensor,  # [B, T] gold target (may contain ignore_index)
-        logits_old: torch.Tensor,  # [B, T, V]
-        logits_new: torch.Tensor,  # [B, T, V]
-        student_logits: Optional[torch.Tensor] = None,  # [B, T, V]
-        *,
-        mode: Literal["hard", "mixture", "hybrid"] = "hard",
-        conf_source: Literal["trueprob", "cce", "rank"] = "trueprob",
-        seq_conf_t_old: Optional[int] = 10,
-        seq_conf_t_new: Optional[int] = 10,
-        conf_agg: Literal["prefix_geom", "prefix_arith", "token"] = "prefix_geom",
-        platt_params_old: Optional[Tuple[float, float]] = None,
-        platt_params_new: Optional[Tuple[float, float]] = None,
-        T_old_conf: float = 1.0,
-        T_new_conf: float = 1.0,
-        cce_pvals_old: Optional[torch.Tensor] = None,
-        cce_pvals_new: Optional[torch.Tensor] = None,
-        rank_calib_old: Optional[Mapping[int, torch.Tensor]] = None,
-        rank_calib_new: Optional[Mapping[int, torch.Tensor]] = None,
-        kd_T: float = 1.0,
-        reduction: Literal["mean", "sum", "none"] = "mean",
-        tau_old: Union[float, Mapping[int, float]] = 0.6,
-        tau_new: Union[float, Mapping[int, float]] = 0.6,
-        scale_old: Optional[Mapping[int, float]] = None,
-        scale_new: Optional[Mapping[int, float]] = None,
-        global_scale_old: float = 1.0,
-        global_scale_new: float = 1.0,
-        gate_mode: Literal["none", "sigmoid", "softplus"] = "sigmoid",
-        Tg: float = 0.5,
-        normalize_gates: bool = True,
-        require_old_correct: bool = False,
-        require_new_correct: bool = False,
-        priority: Literal["old", "new"] = "old",
-        soften_hard: bool = False,
-        use_gate_for_beta: bool = True,
-        beta_mode: Literal["relative", "ratio", "fixed"] = "relative",
-        beta_fixed: float = 0.5,
-        beta_lambda: float = 5.0,
-        beta_clip: float = 1e-3,
-        band_old: float = 0.05,
-        band_new: float = 0.05,
-        band_temp: float = 0.25,
-        ignore_index: int = -100,
-) -> dict:
-    device = logits_old.device
-    B, T, V = logits_old.shape
-    mask = (y != ignore_index).float()  # [B, T]
-
-    pred_old = logits_old.argmax(dim=-1)
-    pred_new = logits_new.argmax(dim=-1)
-    old_correct = (pred_old == y) & (y != ignore_index)
-    new_correct = (pred_new == y) & (y != ignore_index)
-
-    # ---------- confidence ----------
-    if conf_source == "trueprob":
-        c0 = _trueclass_prob(logits_old, y, T=T_old_conf, agg=conf_agg, seq_conf_t=seq_conf_t_old,
-                             platt_params=platt_params_old)
-        ct = _trueclass_prob(logits_new, y, T=T_new_conf, agg=conf_agg, seq_conf_t=seq_conf_t_new,
-                             platt_params=platt_params_new)
-    elif conf_source == "cce":
-        assert cce_pvals_old is not None and cce_pvals_new is not None
-        c0 = cce_pvals_old.to(device).clamp(0, 1)
-        ct = cce_pvals_new.to(device).clamp(0, 1)
-    elif conf_source == "rank":
-        assert rank_calib_old is not None and rank_calib_new is not None
-        c0 = _percentile_rank_trueprob(logits_old, y, rank_calib_old, T=T_old_conf)
-        ct = _percentile_rank_trueprob(logits_new, y, rank_calib_new, T=T_new_conf)
-    else:
-        raise ValueError(f"Unknown conf_source: {conf_source}")
-
-    # ---------- thresholds ----------
-    tau0_ps = _lookup_per_class(y, tau_old if isinstance(tau_old, dict) else None, float(tau_old))
-    taut_ps = _lookup_per_class(y, tau_new if isinstance(tau_new, dict) else None, float(tau_new))
-
-    m0 = c0 - tau0_ps
-    mt = ct - taut_ps
-
-    s0 = _lookup_per_class(y, scale_old, global_scale_old).clamp_min(1e-6)
-    st = _lookup_per_class(y, scale_new, global_scale_new).clamp_min(1e-6)
-
-    alpha0 = _gate(m0 / (s0 * Tg + 1e-8), gate_mode)
-    alphat = _gate(mt / (st * Tg + 1e-8), gate_mode)
-
-    if normalize_gates:
-        mean0 = alpha0[mask.bool()].mean().clamp_min(1e-8) if mask.any() else alpha0.mean().clamp_min(1e-8)
-        meant = alphat[mask.bool()].mean().clamp_min(1e-8) if mask.any() else alphat.mean().clamp_min(1e-8)
-        alpha0 = alpha0 / mean0
-        alphat = alphat / meant
-
-    p_old = F.softmax(logits_old / kd_T, dim=-1)
-    p_new = F.softmax(logits_new / kd_T, dim=-1)
-
-    out = {"conf_old": c0, "conf_new": ct, "alpha_old": alpha0, "alpha_new": alphat,
-           "pred_old": pred_old, "pred_new": pred_new}
-
-    # ---------- HARD mode ----------
-    if mode == "hard":
-        with torch.no_grad():
-            old_accept = (c0 >= tau0_ps) & mask.bool()
-            new_accept = (ct >= taut_ps) & mask.bool()
-            if require_old_correct: old_accept &= old_correct
-            if require_new_correct: new_accept &= new_correct
-
-            if priority == "old":
-                keep_mask = old_accept
-                gain_mask = (~keep_mask) & new_accept
-            else:
-                gain_mask = new_accept
-                keep_mask = (~gain_mask) & old_accept
-
-        out.update({"keep_mask": keep_mask, "gain_mask": gain_mask})
-
-        # ---------- selection counts ----------
-        num_old = keep_mask.sum().item()
-        num_new = gain_mask.sum().item()
-        num_none = ((~keep_mask) & (~gain_mask) & mask.bool()).sum().item()
-        total = mask.sum().item()
-        out.update({
-            "num_old": num_old,
-            "num_new": num_new,
-            "num_none": num_none,
-            "total_token": total
-        })
-
-        if student_logits is not None:
-            KL_S_old = _kl_vec(student_logits, logits_old, T=kd_T)
-            KL_S_new = _kl_vec(student_logits, logits_new, T=kd_T)
-            if not soften_hard:
-                L_keep = (KL_S_old * keep_mask.float()).sum() / keep_mask.float().sum().clamp_min(1e-8)
-                L_gain = (KL_S_new * gain_mask.float()).sum() / gain_mask.float().sum().clamp_min(1e-8)
-            else:
-                L_keep = (KL_S_old * alpha0 * mask).sum() / mask.sum().clamp_min(1e-8)
-                L_gain = (KL_S_new * alphat * mask).sum() / mask.sum().clamp_min(1e-8)
-            L_total = L_keep + L_gain
-            out.update({"L_keep": L_keep, "L_gain": L_gain, "L_total": L_total})
-        return out
-
-    # ---------- MIXTURE ----------
-    if mode == "mixture":
-        beta = alphat / (alphat + alpha0 + 1e-8) if use_gate_for_beta else torch.full_like(c0, beta_fixed)
-        if beta_clip is not None and beta_clip > 0: beta = beta.clamp(min=beta_clip, max=1 - 1e-3)
-        p_star = beta.unsqueeze(-1) * p_new + (1 - beta).unsqueeze(-1) * p_old
-        out.update({"beta": beta, "p_star": p_star})
-        if student_logits is not None:
-            log_pS = F.log_softmax(student_logits / kd_T, dim=-1)
-            kl_vec = F.kl_div(log_pS, p_star, reduction="none").sum(-1) * (kd_T * kd_T)
-            L_kd_mix = (kl_vec * mask).sum() / mask.sum().clamp_min(1e-8) if reduction == "mean" else (
-                        kl_vec * mask).sum()
-            out.update({"L_kd_mix": L_kd_mix, "kd_vec": kl_vec})
-        return out
-
-    # ---------- HYBRID ----------
-    if mode == "hybrid":
-        def sig(x, t):
-            return torch.sigmoid(x / t)
-
-        old_hard = sig(m0 - band_old, band_temp) * mask
-        new_hard = sig(mt - band_new, band_temp) * mask
-        Z = old_hard + new_hard + 1e-8
-        wK = old_hard / Z
-        wG = new_hard / Z
-        beta = alphat / (alphat + alpha0 + 1e-8)
-        p_star = beta.unsqueeze(-1) * p_new + (1 - beta).unsqueeze(-1) * p_old
-        out.update({"wK": wK, "wG": wG, "beta": beta, "p_star": p_star})
-        if student_logits is not None:
-            KL_S_old = _kl_vec(student_logits, logits_old, T=kd_T)
-            KL_S_new = _kl_vec(student_logits, logits_new, T=kd_T)
-            log_pS = F.log_softmax(student_logits / kd_T, dim=-1)
-            KL_S_mix = F.kl_div(log_pS, p_star, reduction="none").sum(-1) * (kd_T * kd_T)
-            L_total = ((wK * KL_S_old + wG * KL_S_new + KL_S_mix * (1 - wK - wG)) * mask).sum() / mask.sum().clamp_min(
-                1e-8)
-            out.update({"L_total": L_total})
-        return out
-
-    raise ValueError(f"Unknown mode {mode}")
 
 
 def _masked_mean_pool_seq(enc_hidden: torch.Tensor, enc_attn_mask: torch.Tensor) -> torch.Tensor:
@@ -1359,8 +1108,6 @@ def kg_loss_from_enc_mse_by_avg_conf(
         "num_new": num_new,
         "num_none": num_none,
         # keep placeholders that original code might try to fetch
-        "L_keep": None,
-        "L_gain": None,
     }
 
 
@@ -1368,32 +1115,24 @@ def kg_loss_from_enc_mse_by_avg_conf(
 # __main__
 # =========================
 if __name__ == "__main__":
-    base_model_path = "/base_model_path"
-    adapter_paths = [
-        "/adapter_path",
-    ]
-    val_files = [
-        "/valid.jsonl",
-    ]
+    args = parse_args()
+    os.makedirs(args.out_adapter_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(args.out_full_pt_path), exist_ok=True)
 
-    out_adapter_dir = "./out_adapter_dir"
-    out_full_pt_path = "./out_full_pt_path/merged_state_dict.pt"
-    os.makedirs(os.path.dirname(out_full_pt_path), exist_ok=True)
-
-    # === train + stitch + export full ===
     localize_and_stitch_loraB_and_export_full(
-        base_model_path=base_model_path,
-        adapter_paths=adapter_paths,
-        val_files=val_files,
-        out_adapter_dir=out_adapter_dir,
-        out_full_pt_path=out_full_pt_path,
-        loc_epochs=20,
-        loc_lr=1e6, # last_task_lr = 1e8
-        loc_l1=2.0, # last_task_l1 = 1.0
-        loc_l2=0,   # last_task_l1 = 0.1
-        loc_sigmoid_bias=5.0,
-        loc_sparsity=1.0,
-        loc_max_batches=68424, # valid data max batches
-        loc_sample_cap=None,
-        batch_size=4
+        base_model_path=args.base_model_path,
+        adapter_paths=args.adapter_paths,
+        val_files=args.val_files,
+        out_adapter_dir=args.out_adapter_dir,
+        out_full_pt_path=args.out_full_pt_path,
+        loc_epochs=args.loc_epochs,
+        loc_lr=args.loc_lr, 
+        loc_l1=args.loc_l1,
+        loc_l2=args.loc_l2,
+        loc_sigmoid_bias=args.loc_sigmoid_bias,
+        loc_sparsity=args.loc_sparsity,
+        loc_max_batches=args.loc_max_batches,
+        loc_sample_cap=args.loc_sample_cap,
+        batch_size=args.batch_size,
+        use_kg_loss=args.use_kg_loss,
     )
