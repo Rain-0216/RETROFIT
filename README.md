@@ -2,6 +2,8 @@
 
 This repository contains the official implementation of our paper on achieving Bounded Forgetting in Security Applications through continual learning techniques.
 
+
+
 ## MALWARE DETECTION
 
 ### Model
@@ -28,6 +30,7 @@ python Malware_Detection/train_ours.py
 ### Eval
 
 First, we use the built-in f1_score function imported from sklearn.metrics to sequentially evaluate the F1 score of each task's model on the task itself, as well as the F1 scores across all previous tasks, and then calculate the AUT and PTR values.
+
 
 
 ## BINARY ANALYSIS
